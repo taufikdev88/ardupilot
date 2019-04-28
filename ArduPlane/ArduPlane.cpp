@@ -485,8 +485,10 @@ void Plane::update_flight_mode(void)
     {
     case AUTO:
         handle_auto_mode();
-        plane.g.pitch_trim_cd=0;
-        break;
+	if(plane.g.pitch_trim_cd != 0) {
+	    plane.g.pitch_trim_cd = 0;
+        }
+	break;
 
     case AVOID_ADSB:
     case GUIDED:
@@ -498,6 +500,9 @@ void Plane::update_flight_mode(void)
 
     case RTL:
     case LOITER:
+	if(plane.g.pitch_trim_cd != 0) {
+		plane.g.pitch_trim_cd = 0;
+	}
         calc_nav_roll();
         calc_nav_pitch();
         calc_throttle();
@@ -552,7 +557,9 @@ void Plane::update_flight_mode(void)
 
     case AUTOTUNE:
     case FLY_BY_WIRE_A: {
-        plane.g.pitch_trim_cd=60;
+	if(plane.g.pitch_trim_cd != 6000) {
+            plane.g.pitch_trim_cd = 6000;
+	}
         // set nav_roll and nav_pitch using sticks
         nav_roll_cd  = channel_roll->norm_input() * roll_limit_cd;
         nav_roll_cd = constrain_int32(nav_roll_cd, -roll_limit_cd, roll_limit_cd);
