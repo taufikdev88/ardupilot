@@ -31,7 +31,7 @@
 #define POSCONTROL_DT_50HZ                      0.02f   // time difference in seconds for 50hz update rate
 #define POSCONTROL_DT_400HZ                     0.0025f // time difference in seconds for 400hz update rate
 
-#define POSCONTROL_ACTIVE_TIMEOUT_MS            200     // position controller is considered active if it has been called within the past 0.2 seconds
+#define POSCONTROL_ACTIVE_TIMEOUT_US            200000  // position controller is considered active if it has been called within the past 0.2 seconds
 
 #define POSCONTROL_VEL_ERROR_CUTOFF_FREQ        4.0f    // low-pass filter on velocity error (unit: hz)
 #define POSCONTROL_THROTTLE_CUTOFF_FREQ         2.0f    // low-pass filter on accel error (unit: hz)
@@ -123,13 +123,12 @@ public:
     /// relax_alt_hold_controllers - set all desired and targets to measured
     void relax_alt_hold_controllers(float throttle_setting);
 
-    /// get_alt_target, get_desired_alt - get desired altitude (in cm above home) from loiter or wp controller which should be fed into throttle controller
-    /// To-Do: remove one of the two functions below
+    /// get_alt_target - get desired altitude (in cm above home) from loiter or wp controller which should be fed into throttle controller
     float get_alt_target() const { return _pos_target.z; }
 
     /// get_alt_error - returns altitude error in cm
     float get_alt_error() const;
-    
+
     // returns horizontal error in cm
     float get_horizontal_error() const;
 
@@ -178,7 +177,7 @@ public:
     /// set_limit_accel_xy - mark that accel has been limited
     ///     this prevents integrator buildup
     void set_limit_accel_xy(void) { _limit.accel_xy = true; }
-    
+
     /// calc_leash_length - calculates the horizontal leash length given a maximum speed, acceleration
     ///     should be called whenever the speed, acceleration or position kP is modified
     void calc_leash_length_xy();
@@ -230,7 +229,7 @@ public:
 
     /// update_xy_controller - run the horizontal position controller - should be called at 100hz or higher
     ///     when use_desired_velocity is true the desired velocity (i.e. feed forward) is incorporated at the pos_to_rate step
-    void update_xy_controller(float ekfNavVelGainScaler);
+    void update_xy_controller();
 
     /// set_target_to_stopping_point_xy - sets horizontal target to reasonable stopping position in cm from home
     void set_target_to_stopping_point_xy();
@@ -257,13 +256,13 @@ public:
     ///     velocity targets should we set using set_desired_velocity_xy() method
     ///     callers should use get_roll() and get_pitch() methods and sent to the attitude controller
     ///     throttle targets will be sent directly to the motors
-    void update_vel_controller_xy(float ekfNavVelGainScaler);
-    
+    void update_vel_controller_xy();
+
     /// update_velocity_controller_xyz - run the velocity controller - should be called at 100hz or higher
     ///     velocity targets should we set using set_desired_velocity_xyz() method
     ///     callers should use get_roll() and get_pitch() methods and sent to the attitude controller
     ///     throttle targets will be sent directly to the motors
-    void update_vel_controller_xyz(float ekfNavVelGainScaler);
+    void update_vel_controller_xyz();
 
     /// get desired roll, pitch which should be fed into stabilize controllers
     float get_roll() const { return _roll_target; }
@@ -292,8 +291,12 @@ public:
     // time_since_last_xy_update - returns time in seconds since the horizontal position controller was last run
     float time_since_last_xy_update() const;
 
-    // write log to dataflash
     void write_log();
+
+    // provide feedback on whether arming would be a good idea right now:
+    bool pre_arm_checks(const char *param_prefix,
+                        char *failure_msg,
+                        const uint8_t failure_msg_len);
 
     static const struct AP_Param::GroupInfo var_info[];
 
@@ -347,7 +350,7 @@ protected:
     ///     desired velocity (_vel_desired) is combined into final target velocity
     ///     converts desired velocities in lat/lon directions to accelerations in lat/lon frame
     ///     converts desired accelerations provided in lat/lon frame to roll/pitch angles
-    void run_xy_controller(float dt, float ekfNavVelGainScaler);
+    void run_xy_controller(float dt);
 
     /// calc_leash_length - calculates the horizontal leash length given a maximum speed, acceleration and position kP gain
     float calc_leash_length(float speed_cms, float accel_cms, float kP) const;
@@ -381,8 +384,8 @@ protected:
 
     // internal variables
     float       _dt;                    // time difference (in seconds) between calls from the main program
-    uint32_t    _last_update_xy_ms;     // system time of last update_xy_controller call
-    uint32_t    _last_update_z_ms;      // system time of last update_z_controller call
+    uint64_t    _last_update_xy_us;     // system time (in microseconds) since last update_xy_controller call
+    uint64_t    _last_update_z_us;      // system time (in microseconds) of last update_z_controller call
     float       _speed_down_cms;        // max descent rate in cm/s
     float       _speed_up_cms;          // max climb rate in cm/s
     float       _speed_cms;             // max horizontal speed in cm/s
@@ -408,7 +411,6 @@ protected:
     Vector3f    _accel_target;          // acceleration target in cm/s/s
     Vector3f    _accel_error;           // acceleration error in cm/s/s
     Vector2f    _vehicle_horiz_vel;     // velocity to use if _flags.vehicle_horiz_vel_override is set
-    float       _distance_to_target;    // distance to position target - for reporting only
     LowPassFilterFloat _vel_error_filter;   // low-pass-filter on z-axis velocity error
 
     LowPassFilterVector2f _accel_target_filter; // acceleration target filter

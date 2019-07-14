@@ -29,6 +29,7 @@
 #define APM_STORAGE_PRIORITY     59
 #define APM_IO_PRIORITY          58
 #define APM_STARTUP_PRIORITY     10
+#define APM_SCRIPTING_PRIORITY  LOWPRIO
 
 /*
   boost priority handling
@@ -75,7 +76,7 @@ public:
     /* AP_HAL::Scheduler methods */
 
 
-    void     init();
+    void     init() override;
     void     delay(uint16_t ms) override;
     void     delay_microseconds(uint16_t us) override;
     void     delay_microseconds_boost(uint16_t us) override;
@@ -86,11 +87,19 @@ public:
     void     reboot(bool hold_in_bootloader) override;
 
     bool     in_main_thread() const override;
-    void     system_initialized();
+    void     system_initialized() override;
     void     hal_initialized() { _hal_initialized = true; }
 
     bool     check_called_boost(void);
 
+    /*
+      inform the scheduler that we are calling an operation from the
+      main thread that may take an extended amount of time. This can
+      be used to prevent watchdog reset during expected long delays
+      A value of zero cancels the previous expected delay
+     */
+    void     expect_delay_ms(uint32_t ms) override;
+    
     /*
       disable interrupts and return a context that can be used to
       restore the interrupt state. This can be used to protect
@@ -114,7 +123,8 @@ private:
     AP_HAL::Proc _failsafe;
     bool _called_boost;
     bool _priority_boosted;
-
+    uint32_t expect_delay_start;
+    uint32_t expect_delay_length;
 
     AP_HAL::MemberProc _timer_proc[CHIBIOS_SCHEDULER_MAX_TIMER_PROCS];
     uint8_t _num_timer_procs;

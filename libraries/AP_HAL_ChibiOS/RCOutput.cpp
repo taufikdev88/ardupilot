@@ -20,6 +20,7 @@
 #include <AP_HAL/utility/RingBuffer.h>
 #include "GPIO.h"
 #include "hwdef/common/stm32_util.h"
+#include "hwdef/common/watchdog.h"
 
 #if HAL_USE_PWM == TRUE
 
@@ -514,8 +515,7 @@ bool RCOutput::setup_group_DMA(pwm_group &group, uint32_t bitrate, uint32_t bit_
         }
     }
     // for dshot we setup for DMAR based output
-    if (!group.dma) {
-        group.dma = STM32_DMA_STREAM(group.dma_up_stream_id);
+    if (!group.dma_handle) {
         group.dma_handle = new Shared_DMA(group.dma_up_stream_id, SHARED_DMA_NONE,
                                           FUNCTOR_BIND_MEMBER(&RCOutput::dma_allocate, void, Shared_DMA *),
                                           FUNCTOR_BIND_MEMBER(&RCOutput::dma_deallocate, void, Shared_DMA *));
@@ -682,6 +682,11 @@ void RCOutput::set_output_mode(uint16_t mask, enum output_mode mode)
         iomcu.set_freq(io_fast_channel_mask, 1);
         return iomcu.set_oneshot_mode();
     }
+    if (mode == MODE_PWM_BRUSHED &&
+        (mask & ((1U<<chan_offset)-1)) &&
+        AP_BoardConfig::io_enabled()) {
+        return iomcu.set_brushed_mode();
+    }
 #endif
 }
 
@@ -814,8 +819,15 @@ void RCOutput::dma_allocate(Shared_DMA *ctx)
 {
     for (uint8_t i = 0; i < NUM_GROUPS; i++ ) {
         pwm_group &group = pwm_group_list[i];
-        if (group.dma_handle == ctx) {
-            dmaStreamAllocate(group.dma, 10, dma_irq_callback, &group);
+        if (group.dma_handle == ctx && group.dma == nullptr) {
+            chSysLock();
+            group.dma = dmaStreamAllocI(group.dma_up_stream_id, 10, dma_irq_callback, &group);
+            chSysUnlock();
+#if STM32_DMA_SUPPORTS_DMAMUX
+            if (group.dma) {
+                dmaSetRequestSource(group.dma, group.dma_up_channel);
+            }
+#endif
         }
     }
 }
@@ -827,8 +839,11 @@ void RCOutput::dma_deallocate(Shared_DMA *ctx)
 {
     for (uint8_t i = 0; i < NUM_GROUPS; i++ ) {
         pwm_group &group = pwm_group_list[i];
-        if (group.dma_handle == ctx) {
-            dmaStreamRelease(group.dma);
+        if (group.dma_handle == ctx && group.dma != nullptr) {
+            chSysLock();
+            dmaStreamFreeI(group.dma);
+            group.dma = nullptr;
+            chSysUnlock();
         }
     }
 }
@@ -913,14 +928,31 @@ void RCOutput::dshot_send(pwm_group &group, bool blocking)
                 pwm = safe_pwm[chan+chan_offset];
             }
             
-            pwm = constrain_int16(pwm, _esc_pwm_min, _esc_pwm_max);
-            uint16_t value = 2000UL * uint32_t(pwm - _esc_pwm_min) / uint32_t(_esc_pwm_max - _esc_pwm_min);
-            //uint32_t value = (chan+1) * 3;
+            const uint16_t chan_mask = (1U<<chan);
+            if (pwm == 0) {
+                // no output
+                continue;
+            }
+
+            pwm = constrain_int16(pwm, 1000, 2000);
+            uint16_t value = 2 * (pwm - 1000);
+
+            if (chan_mask & (reversible_mask>>chan_offset)) {
+                // this is a DShot-3D output, map so that 1500 PWM is zero throttle reversed
+                if (value < 1000) {
+                    value = 2000 - value;
+                } else if (value > 1000) {
+                    value = value - 1000;
+                } else {
+                    // mid-throttle is off
+                    value = 0;
+                }
+            }
             if (value != 0) {
                 // dshot values are from 48 to 2047. Zero means off.
                 value += 47;
             }
-            uint16_t chan_mask = (1U<<chan);
+
             bool request_telemetry = (telem_request_mask & chan_mask)?true:false;
             uint16_t packet = create_dshot_packet(value, request_telemetry);
             if (request_telemetry) {
@@ -958,6 +990,7 @@ void RCOutput::send_pulses_DMAR(pwm_group &group, uint32_t buffer_length)
       up with this great method.
      */
     dmaStreamSetPeripheral(group.dma, &(group.pwm_drv->tim->DMAR));
+    cacheBufferFlush(group.dma_buffer, buffer_length);
     dmaStreamSetMemory0(group.dma, group.dma_buffer);
     dmaStreamSetTransactionSize(group.dma, buffer_length/sizeof(uint32_t));
     dmaStreamSetFIFO(group.dma, STM32_DMA_FCR_DMDIS | STM32_DMA_FCR_FTH_FULL);
@@ -1353,9 +1386,14 @@ AP_HAL::Util::safety_state RCOutput::_safety_switch_state(void)
 {
 #if HAL_WITH_IO_MCU
     if (AP_BoardConfig::io_enabled()) {
-        return iomcu.get_safety_switch_state();
+        safety_state = iomcu.get_safety_switch_state();
     }
 #endif
+    if (safety_state == AP_HAL::Util::SAFETY_ARMED) {
+        stm32_set_backup_safety_state(false);
+    } else if (safety_state == AP_HAL::Util::SAFETY_DISARMED) {
+        stm32_set_backup_safety_state(true);
+    }
     return safety_state;
 }
 
@@ -1419,7 +1457,7 @@ void RCOutput::safety_update(void)
     }
     safety_update_ms = now;
 
-    AP_BoardConfig *boardconfig = AP_BoardConfig::get_instance();
+    AP_BoardConfig *boardconfig = AP_BoardConfig::get_singleton();
 
     if (boardconfig) {
         // remember mask of channels to allow with safety on
@@ -1438,11 +1476,11 @@ void RCOutput::safety_update(void)
         safety_pressed = false;
     }
     if (safety_state==AP_HAL::Util::SAFETY_DISARMED &&
-        !(safety_options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_ON)) {
+        !(safety_options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_OFF)) {
         safety_pressed = false;        
     }
     if (safety_state==AP_HAL::Util::SAFETY_ARMED &&
-        !(safety_options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_OFF)) {
+        !(safety_options & AP_BoardConfig::BOARD_SAFETY_OPTION_BUTTON_ACTIVE_SAFETY_ON)) {
         safety_pressed = false;        
     }
     if (safety_pressed) {

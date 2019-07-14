@@ -59,8 +59,8 @@ bylabel = {}
 # list of SPI devices
 spidev = []
 
-# list of ROMFS files
-romfs = []
+# dictionary of ROMFS files
+romfs = {}
 
 # SPI bus list
 spi_list = []
@@ -121,6 +121,10 @@ def get_alt_function(mcu, pin, function):
     '''return alternative function number for a pin'''
     lib = get_mcu_lib(mcu)
 
+    if function.endswith('_TXINV') or function.endswith('_RXINV'):
+        # RXINV and TXINV are special labels for inversion pins, not alt-functions
+        return None
+    
     if hasattr(lib, "AltFunction_map"):
         alt_map = lib.AltFunction_map
     else:
@@ -177,9 +181,22 @@ class generic_pin(object):
         self.type = type
         self.extra = extra
         self.af = None
-        self.sig_dir = 'INPUT'
+        if type == 'OUTPUT':
+            self.sig_dir = 'OUTPUT'
+        else:
+            self.sig_dir = 'INPUT'
         if mcu_series == "STM32F100" and self.label is not None:
             self.f1_pin_setup()
+
+        # check that labels and pin types are consistent
+        for prefix in ['USART', 'UART', 'TIM']:
+            if label is None or type is None:
+                continue
+            if type.startswith(prefix):
+                a1 = label.split('_')
+                a2 = type.split('_')
+                if a1[0] != a2[0]:
+                    error("Peripheral prefix mismatch for %s %s %s" % (self.portpin, label, type))
 
     def f1_pin_setup(self):
         for l in af_labels:
@@ -273,6 +290,7 @@ class generic_pin(object):
         v = 'FLOATING'
         if self.is_CS():
             v = "PULLUP"
+        # generate pullups for UARTs
         if (self.type.startswith('USART') or
             self.type.startswith('UART')) and (
             (self.label.endswith('_TX') or
@@ -280,13 +298,40 @@ class generic_pin(object):
              self.label.endswith('_CTS') or
              self.label.endswith('_RTS'))):
                 v = "PULLUP"
+        # generate pullups for SDIO and SDMMC
+        if (self.type.startswith('SDIO') or
+            self.type.startswith('SDMMC')) and (
+            (self.label.endswith('_D0') or
+             self.label.endswith('_D1') or
+             self.label.endswith('_D2') or
+             self.label.endswith('_D3') or
+             self.label.endswith('_CMD'))):
+                v = "PULLUP"
         for e in self.extra:
             if e in values:
                 v = e
         return "PIN_PUPDR_%s(%uU)" % (v, self.pin)
 
+    def get_ODR_F1(self):
+        '''return one of LOW, HIGH'''
+        values = ['LOW', 'HIGH']
+        v = 'HIGH'
+        if self.type == 'OUTPUT':
+            v = 'LOW'
+        for e in self.extra:
+            if e in values:
+                v = e
+        #for some controllers input pull up down is selected by ODR
+        if self.type == "INPUT":
+            v = 'LOW'
+            if 'PULLUP' in self.extra:
+                v = "HIGH"
+        return "PIN_ODR_%s(%uU)" % (v, self.pin)
+
     def get_ODR(self):
         '''return one of LOW, HIGH'''
+        if mcu_series == "STM32F100":
+            return self.get_ODR_F1()
         values = ['LOW', 'HIGH']
         v = 'HIGH'
         for e in self.extra:
@@ -313,27 +358,45 @@ class generic_pin(object):
             return None
         return self.get_AFIO()
 
-    #F1 series GPIO Cfg methods
-
-    def get_ODR(self):
-        '''return one of LOW, HIGH'''
-        values = ['LOW', 'HIGH']
-        v = 'HIGH'
-        if self.type == 'OUTPUT':
-            v = 'LOW'
-        for e in self.extra:
-            if e in values:
-                v = e
-        #for some controllers input pull up down is selected by ODR
-        if self.type == "INPUT":
-            v = 'LOW'
-            if 'PULLUP' in self.extra:
-                v = "HIGH"
-        return "PIN_ODR_%s(%uU)" % (v, self.pin)
+    def get_CR_F1(self):
+        '''return CR FLAGS for STM32F1xx'''
+        #Check Speed
+        if self.sig_dir != "INPUT" or self.af is not None:
+            speed_values = ['SPEED_LOW', 'SPEED_MEDIUM', 'SPEED_HIGH']
+            v = 'SPEED_MEDIUM'
+            for e in self.extra:
+                if e in speed_values:
+                    v = e
+            speed_str = "PIN_%s(%uU) |" % (v, self.pin)
+        else:
+            speed_str = ""
+        if self.af is not None:
+            if self.label.endswith('_RX'):
+                # uart RX is configured as a input, and can be pullup, pulldown or float
+                if 'PULLUP' in self.extra or 'PULLDOWN' in self.extra:
+                    v = 'PUD'
+                else:
+                    v = "NOPULL"
+            else:
+                v = "AF_PP"
+        elif self.sig_dir == 'OUTPUT':
+            if 'OPENDRAIN' in self.extra:
+                v = 'OUTPUT_OD'
+            else:
+                v = "OUTPUT_PP"
+        elif self.type.startswith('ADC'):
+            v = "ANALOG"
+        else:
+            v = "PUD"
+            if 'FLOATING' in self.extra:
+                v = "NOPULL"
+        mode_str = "PIN_MODE_%s(%uU)" % (v, self.pin)
+        return "%s %s" % (speed_str, mode_str)
 
     def get_CR(self):
         '''return CR FLAGS'''
-        #Check Speed
+        if mcu_series == "STM32F100":
+            return self.get_CR_F1()
         if self.sig_dir != "INPUT":
             speed_values = ['SPEED_LOW', 'SPEED_MEDIUM', 'SPEED_HIGH']
             v = 'SPEED_MEDIUM'
@@ -440,7 +503,10 @@ def write_mcu_config(f):
     '''write MCU config defines'''
     f.write('// MCU type (ChibiOS define)\n')
     f.write('#define %s_MCUCONF\n' % get_config('MCU'))
-    f.write('#define %s\n\n' % get_config('MCU', 1))
+    mcu_subtype = get_config('MCU', 1)
+    if mcu_subtype.endswith('xx'):
+        f.write('#define %s_MCUCONF\n\n' % mcu_subtype[:-2])
+    f.write('#define %s\n\n' % mcu_subtype)
     f.write('// crystal frequency\n')
     f.write('#define STM32_HSECLK %sU\n\n' % get_config('OSCILLATOR_HZ'))
     f.write('// UART used for stdout (printf)\n')
@@ -503,31 +569,18 @@ def write_mcu_config(f):
     f.write('#define BOARD_FLASH_SIZE %u\n' % flash_size)
     f.write('#define CRT1_AREAS_NUMBER 1\n')
 
-    # get core-coupled-memory if available (not be DMA capable)
-    ccm_size = get_mcu_config('CCM_RAM_SIZE_KB')
-    if ccm_size is not None:
-        f.write('\n// core-coupled memory\n')
-        f.write('#define CCM_RAM_SIZE_KB %u\n' % ccm_size)
-        f.write('#define CCM_BASE_ADDRESS 0x%08x\n' % get_mcu_config('CCM_BASE_ADDRESS', True))
-
-    # get DTCM memory if available (DMA-capable with no cache flush/invalidate)
-    dtcm_size = get_mcu_config('DTCM_RAM_SIZE_KB')
-    if dtcm_size is not None:
-        f.write('\n// DTCM memory\n')
-        f.write('#define DTCM_RAM_SIZE_KB %u\n' % dtcm_size)
-        f.write('#define DTCM_BASE_ADDRESS 0x%08x\n' % get_mcu_config('DTCM_BASE_ADDRESS', True))
-        
     flash_reserve_start = get_config(
         'FLASH_RESERVE_START_KB', default=16, type=int)
     f.write('\n// location of loaded firmware\n')
     f.write('#define FLASH_LOAD_ADDRESS 0x%08x\n' % (0x08000000 + flash_reserve_start*1024))
     f.write('\n')
 
-    ram_size_kb = get_mcu_config('RAM_SIZE_KB', True)
-    ram_base_address = get_mcu_config('RAM_BASE_ADDRESS', True)
-    f.write('// main memory size and address\n')
-    f.write('#define HAL_RAM_SIZE_KB %uU\n' % ram_size_kb)
-    f.write('#define HAL_RAM_BASE_ADDRESS 0x%08x\n' % ram_base_address)
+    ram_map = get_mcu_config('RAM_MAP', True)
+    f.write('// memory regions\n')
+    regions = []
+    for (address, size, flags) in ram_map:
+        regions.append('{(void*)0x%08x, 0x%08x, 0x%02x }' % (address, size*1024, flags))
+    f.write('#define HAL_MEMORY_REGIONS %s\n' % ', '.join(regions))
 
     f.write('\n// CPU serial number (12 bytes)\n')
     f.write('#define UDID_START 0x%08x\n\n' % get_mcu_config('UDID_START', True))
@@ -600,9 +653,8 @@ def write_ldscript(fname):
     # space to reserve for storage at end of flash
     flash_reserve_end = get_config('FLASH_RESERVE_END_KB', default=0, type=int)
 
-    # ram size
-    ram_size = get_mcu_config('RAM_SIZE_KB', True)
-    ram_base = get_mcu_config('RAM_BASE_ADDRESS', True)
+    # ram layout
+    ram_map = get_mcu_config('RAM_MAP', True)
 
     flash_base = 0x08000000 + flash_reserve_start * 1024
     flash_length = flash_size - (flash_reserve_start + flash_reserve_end)
@@ -617,7 +669,7 @@ MEMORY
 }
 
 INCLUDE common.ld
-''' % (flash_base, flash_length, ram_base, ram_size))
+''' % (flash_base, flash_length, ram_map[0][0], ram_map[0][1]))
 
 def copy_common_linkerscript(outdir, hwdef):
     dirpath = os.path.dirname(hwdef)
@@ -696,11 +748,25 @@ def write_SPI_config(f):
         n = int(dev[3:])
         devlist.append('HAL_SPI%u_CONFIG' % n)
         f.write(
-            '#define HAL_SPI%u_CONFIG { &SPID%u, %u, STM32_SPI_SPI%u_TX_DMA_STREAM, STM32_SPI_SPI%u_RX_DMA_STREAM }\n'
-            % (n, n, n, n, n))
+            '#define HAL_SPI%u_CONFIG { &SPID%u, %u, STM32_SPI_SPI%u_DMA_STREAMS }\n'
+            % (n, n, n, n))
     f.write('#define HAL_SPI_BUS_LIST %s\n\n' % ','.join(devlist))
     write_SPI_table(f)
 
+
+def get_gpio_bylabel(label):
+    '''get GPIO(n) setting on a pin label, or -1'''
+    p = bylabel.get(label)
+    if p is None:
+        return -1
+    return p.extra_value('GPIO', type=int, default=-1)
+
+def get_extra_bylabel(label, name, default=None):
+    '''get extra setting for a label by name'''
+    p = bylabel.get(label)
+    if p is None:
+        return default
+    return p.extra_value(name, type=str, default=default)
 
 def write_UART_config(f):
     '''write UART config defines'''
@@ -734,6 +800,7 @@ def write_UART_config(f):
             '#define HAL_UART_IO_DRIVER ChibiOS::UARTDriver uart_io(HAL_UART_IOMCU_IDX)\n'
         )
         uart_list.append(config['IOMCU_UART'][0])
+        f.write('#define HAL_HAVE_SERVO_VOLTAGE 1\n') # make the assumption that IO gurantees servo monitoring
     else:
         f.write('#define HAL_WITH_IO_MCU 0\n')
     f.write('\n')
@@ -766,11 +833,22 @@ def write_UART_config(f):
             f.write(
                 "#define HAL_%s_CONFIG { (BaseSequentialStream*) &SD%u, false, "
                 % (dev, n))
-            f.write("STM32_%s_RX_DMA_CONFIG, STM32_%s_TX_DMA_CONFIG, %s}\n" %
+            f.write("STM32_%s_RX_DMA_CONFIG, STM32_%s_TX_DMA_CONFIG, %s, " %
                     (dev, dev, rts_line))
+
+            # add inversion pins, if any
+            f.write("%d, " % get_gpio_bylabel(dev + "_RXINV"))
+            f.write("%s, " % get_extra_bylabel(dev + "_RXINV", "POL", "0"))
+            f.write("%d, " % get_gpio_bylabel(dev + "_TXINV"))
+            f.write("%s}\n" % get_extra_bylabel(dev + "_TXINV", "POL", "0"))
+
     f.write('#define HAL_UART_DEVICE_LIST %s\n\n' % ','.join(devlist))
     if not need_uart_driver and not args.bootloader:
-        f.write('#define HAL_USE_SERIAL FALSE\n')
+        f.write('''
+#ifndef HAL_USE_SERIAL
+#define HAL_USE_SERIAL HAL_USE_SERIAL_USB
+#endif
+''')
 
 def write_UART_config_bootloader(f):
     '''write UART config defines'''
@@ -788,7 +866,11 @@ def write_UART_config_bootloader(f):
             have_uart = True
     f.write('#define BOOTLOADER_DEV_LIST %s\n' % ','.join(devlist))
     if not have_uart:
-        f.write('#define HAL_USE_SERIAL FALSE\n')
+        f.write('''
+#ifndef HAL_USE_SERIAL
+#define HAL_USE_SERIAL FALSE
+#endif
+''')
 
 def write_I2C_config(f):
     '''write I2C config defines'''
@@ -803,6 +885,8 @@ def write_I2C_config(f):
     if len(i2c_list) == 0:
         error("I2C_ORDER invalid")
     devlist = []
+
+    # write out config structures
     for dev in i2c_list:
         if not dev.startswith('I2C') or dev[3] not in "1234":
             error("Bad I2C_ORDER element %s" % dev)
@@ -810,17 +894,12 @@ def write_I2C_config(f):
         devlist.append('HAL_I2C%u_CONFIG' % n)
         f.write('''
 #if defined(STM32_I2C_I2C%u_RX_DMA_STREAM) && defined(STM32_I2C_I2C%u_TX_DMA_STREAM)
-#define HAL_I2C%u_CONFIG { &I2CD%u, STM32_I2C_I2C%u_RX_DMA_STREAM, STM32_I2C_I2C%u_TX_DMA_STREAM }
+#define HAL_I2C%u_CONFIG { &I2CD%u, STM32_I2C_I2C%u_RX_DMA_STREAM, STM32_I2C_I2C%u_TX_DMA_STREAM, HAL_GPIO_PIN_I2C%u_SCL, HAL_GPIO_PIN_I2C%u_SDA }
 #else
-#define HAL_I2C%u_CONFIG { &I2CD%u, SHARED_DMA_NONE, SHARED_DMA_NONE }
+#define HAL_I2C%u_CONFIG { &I2CD%u, SHARED_DMA_NONE, SHARED_DMA_NONE, HAL_GPIO_PIN_I2C%u_SCL, HAL_GPIO_PIN_I2C%u_SDA }
 #endif
 '''
-            % (n, n, n, n, n, n, n, n))
-        if dev + "_SCL" in bylabel:
-            p = bylabel[dev + "_SCL"]
-            f.write(
-                '#define HAL_%s_SCL_AF %d\n' % (dev, p.af)
-            )
+            % (n, n, n, n, n, n, n, n, n, n, n, n))
     f.write('\n#define HAL_I2C_DEVICE_LIST %s\n\n' % ','.join(devlist))
 
 def parse_timer(str):
@@ -860,7 +939,11 @@ def write_PWM_config(f):
 
     if not pwm_out:
         print("No PWM output defined")
-        f.write('#define HAL_USE_PWM FALSE\n')
+        f.write('''
+#ifndef HAL_USE_PWM
+#define HAL_USE_PWM FALSE
+#endif
+''')
         
     if rc_in is not None:
         (n, chan, compl) = parse_timer(rc_in.label)
@@ -971,11 +1054,11 @@ def write_PWM_config(f):
             advanced_timer = 'false'
         pwm_clock = 1000000
         period = 20000 * pwm_clock / 1000000
-        f.write('''#ifdef STM32_TIM_TIM%u_UP_DMA_STREAM
+        f.write('''#if defined(STM32_TIM_TIM%u_UP_DMA_STREAM) && defined(STM32_TIM_TIM%u_UP_DMA_CHAN)
 # define HAL_PWM%u_DMA_CONFIG true, STM32_TIM_TIM%u_UP_DMA_STREAM, STM32_TIM_TIM%u_UP_DMA_CHAN
 #else
 # define HAL_PWM%u_DMA_CONFIG false, 0, 0
-#endif\n''' % (n, n, n, n, n))
+#endif\n''' % (n, n, n, n, n, n))
         f.write('''#define HAL_PWM_GROUP%u { %s, \\
         {%u, %u, %u, %u}, \\
         /* Group Initial Config */ \\
@@ -1015,6 +1098,7 @@ def write_ADC_config(f):
         scale = p.extra_value('SCALE', default=None)
         if p.label == 'VDD_5V_SENS':
             f.write('#define ANALOG_VCC_5V_PIN %u\n' % chan)
+            f.write('#define HAL_HAVE_BOARD_VOLTAGE 1\n')
         adc_chans.append((chan, scale, p.label, p.portpin))
     adc_chans = sorted(adc_chans)
     vdd = get_config('STM32_VDD')
@@ -1035,11 +1119,15 @@ def write_GPIO_config(f):
     '''write GPIO config defines'''
     f.write('// GPIO config\n')
     gpios = []
+    gpioset = set()
     for l in bylabel:
         p = bylabel[l]
         gpio = p.extra_value('GPIO', type=int)
         if gpio is None:
             continue
+        if gpio in gpioset:
+            error("Duplicate GPIO value %u" % gpio)
+        gpioset.add(gpio)
         # see if it is also a PWM pin
         pwm = p.extra_value('PWM', type=int, default=0)
         port = p.port
@@ -1086,37 +1174,29 @@ def add_bootloader():
     '''added bootloader to ROMFS'''
     bp = bootloader_path()
     if bp is not None:
-        romfs.append( ("bootloader.bin", bp) )
+        romfs["bootloader.bin"] = bp
 
 def write_ROMFS(outdir):
     '''create ROMFS embedded header'''
-    env_vars['ROMFS_FILES'] = romfs
+    romfs_list = []
+    for k in romfs.keys():
+        romfs_list.append((k, romfs[k]))
+    env_vars['ROMFS_FILES'] = romfs_list
 
-def write_prototype_file():
-    '''write the prototype file for apj generation'''
-    pf = open(os.path.join(outdir, "apj.prototype"), "w")
-    pf.write('''{
-    "board_id": %s, 
-    "magic": "PX4FWv1", 
-    "description": "Firmware for the %s board", 
-    "image": "", 
-    "build_time": 0, 
-    "summary": "PX4FMUv3",
-    "version": "0.1",
-    "image_size": 0,
-    "git_identity": "",
-    "board_revision": 0
-}
-''' % (get_config('APJ_BOARD_ID'),
-       get_config('APJ_BOARD_TYPE', default=mcu_type)))
-
+def setup_apj_IDs():
+    '''setup the APJ board IDs'''
+    env_vars['APJ_BOARD_ID'] = get_config('APJ_BOARD_ID')
+    env_vars['APJ_BOARD_TYPE'] = get_config('APJ_BOARD_TYPE', default=mcu_type)
 
 def write_peripheral_enable(f):
     '''write peripheral enable lines'''
     f.write('// peripherals enabled\n')
     for type in sorted(bytype.keys()):
         if type.startswith('USART') or type.startswith('UART'):
-            f.write('#define STM32_SERIAL_USE_%-6s             TRUE\n' % type)
+            dstr = 'STM32_SERIAL_USE_%-6s' % type
+            f.write('#ifndef %s\n' % dstr)
+            f.write('#define %s TRUE\n' % dstr)
+            f.write('#endif\n')
         if type.startswith('SPI'):
             f.write('#define STM32_SPI_USE_%s                  TRUE\n' % type)
         if type.startswith('OTG'):
@@ -1163,7 +1243,7 @@ def write_hwdef_header(outfilename):
     write_GPIO_config(f)
 
     write_peripheral_enable(f)
-    write_prototype_file()
+    setup_apj_IDs()
 
     dma_resolver.write_dma_header(f, periph_list, mcu_type,
                                   dma_exclude=get_dma_exclude(periph_list),
@@ -1289,7 +1369,8 @@ def build_peripheral_list():
         if type.startswith('ADC'):
             peripherals.append(type)
         if type.startswith('SDIO') or type.startswith('SDMMC'):
-            peripherals.append(type)
+            if not mcu_series.startswith("STM32H7"):
+                peripherals.append(type)
         if type.startswith('TIM'):
             if p.has_extra('RCIN'):
                 label = p.label
@@ -1320,7 +1401,7 @@ def write_env_py(filename):
 
 def romfs_add(romfs_filename, filename):
     '''add a file to ROMFS'''
-    romfs.append((romfs_filename, filename))
+    romfs[romfs_filename] = filename
 
 def romfs_wildcard(pattern):
     '''add a set of files to ROMFS by wildcard'''
@@ -1328,7 +1409,7 @@ def romfs_wildcard(pattern):
     (pattern_dir, pattern) = os.path.split(pattern)
     for f in os.listdir(os.path.join(base_path, pattern_dir)):
         if fnmatch.fnmatch(f, pattern):
-            romfs.append((f, os.path.join(pattern_dir, f)))
+            romfs[f] = os.path.join(pattern_dir, f)
     
 def process_line(line):
     '''process one line of pin definition file'''
